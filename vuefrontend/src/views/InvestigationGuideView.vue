@@ -48,7 +48,7 @@ Authorization: Bearer token-of-user-1</div>
       <h3>Mission 5: Trigger XSS</h3>
       <p>Enter this in notes:</p>
       <div class="code">&lt;img src=x onerror="alert('XSS')"&gt;</div>
-      <p>This app intentionally renders notes using <code>v-html</code>.</p>
+      <p>After the fix, notes should be displayed as plain text.</p>
       <p><strong>Fix idea:</strong> use Vue interpolation: <code v-pre>{{ person.notes }}</code></p>
     </div>
 

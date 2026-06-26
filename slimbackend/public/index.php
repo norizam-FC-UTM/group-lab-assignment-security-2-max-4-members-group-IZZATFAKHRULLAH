@@ -566,7 +566,6 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
         // Updates almost any field sent by the frontend.
         // You should whitelist allowed fields and calculate bmi/category at backend.
         $allowedInInsecureStarter = [
-            'user_id',
             'name',
             'age',
             'height',

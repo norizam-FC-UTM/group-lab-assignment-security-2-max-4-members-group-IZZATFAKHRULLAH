@@ -118,6 +118,59 @@ function exposeException(Response $response, Throwable $e): Response
     ], 500);
 }
 
+function validateBmiData(array $data, bool $requireAllFields = true): array
+{
+    $errors = [];
+
+    if ($requireAllFields || array_key_exists('name', $data)) {
+        $name = trim((string) ($data['name'] ?? ''));
+        if ($name === '') {
+            $errors['name'] = 'Name is required';
+        }
+    }
+
+    if ($requireAllFields || array_key_exists('age', $data)) {
+        $age = $data['age'] ?? null;
+        if (!is_numeric($age) || (int) $age < 1 || (int) $age > 120) {
+            $errors['age'] = 'Age must be between 1 and 120';
+        }
+    }
+
+    if ($requireAllFields || array_key_exists('height', $data)) {
+        $height = $data['height'] ?? null;
+        if (!is_numeric($height) || (float) $height < 0.5 || (float) $height > 2.5) {
+            $errors['height'] = 'Height must be between 0.5 and 2.5 meters';
+        }
+    }
+
+    if ($requireAllFields || array_key_exists('weight', $data)) {
+        $weight = $data['weight'] ?? null;
+        if (!is_numeric($weight) || (float) $weight < 2 || (float) $weight > 300) {
+            $errors['weight'] = 'Weight must be between 2 and 300 kg';
+        }
+    }
+
+    return $errors;
+}
+
+function calculateBmi(float $height, float $weight): float
+{
+    return round($weight / ($height * $height), 2);
+}
+
+function getBmiCategory(float $bmi): string
+{
+    if ($bmi < 18.5) {
+        return 'Underweight';
+    } elseif ($bmi < 25) {
+        return 'Normal';
+    } elseif ($bmi < 30) {
+        return 'Overweight';
+    }
+
+    return 'Obese';
+}
+
 // ----------------------------------------------------------
 // Root routes 
 // ----------------------------------------------------------
@@ -279,18 +332,23 @@ $app->post('/api/persons', function (Request $request, Response $response) {
         $pdo = getPDO();
         $data = getRequestData($request);
 
+        $validationErrors = validateBmiData($data);
+        if ($validationErrors) {
+            return jsonResponse($response, [
+                'error' => 'Invalid BMI data',
+                'details' => $validationErrors
+            ], 400);
+        }
+
         // INSECURE:
-        // - No backend validation.
         // - Trusts user_id from frontend.
-        // - Trusts bmi and category from frontend.
-        // - Does not calculate BMI at backend.
         $user_id = $data['user_id'] ?? 1;
         $name = $data['name'] ?? '';
         $age = $data['age'] ?? 0;
         $height = $data['height'] ?? 0;
         $weight = $data['weight'] ?? 0;
-        $bmi = $data['bmi'] ?? 0;
-        $category = $data['category'] ?? '';
+        $bmi = calculateBmi((float) $height, (float) $weight);
+        $category = getBmiCategory($bmi);
         $notes = $data['notes'] ?? '';
 
         $sql = "INSERT INTO persons (user_id, name, age, height, weight, bmi, category, notes)
@@ -302,7 +360,7 @@ $app->post('/api/persons', function (Request $request, Response $response) {
         $person = $pdo->query("SELECT * FROM persons WHERE id = $id")->fetch();
 
         return jsonResponse($response, [
-            'message' => 'BMI record created. This route trusts frontend data.',
+            'message' => 'BMI record created. Backend calculated BMI and category.',
             'person' => $person,
             'debug_received_body' => $data,
             'debug_sql' => $sql
@@ -341,6 +399,20 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
         $id = $args['id'];
         $data = getRequestData($request);
 
+        $validationErrors = validateBmiData($data, false);
+        if ($validationErrors) {
+            return jsonResponse($response, [
+                'error' => 'Invalid BMI data',
+                'details' => $validationErrors
+            ], 400);
+        }
+
+        $existingPerson = $pdo->query("SELECT * FROM persons WHERE id = $id")->fetch();
+
+        if (!$existingPerson) {
+            return jsonResponse($response, ['error' => 'Record not found'], 404);
+        }
+
         // INSECURE MASS ASSIGNMENT:
         // Updates almost any field sent by the frontend.
         // You should whitelist allowed fields and calculate bmi/category at backend.
@@ -350,8 +422,6 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
             'age',
             'height',
             'weight',
-            'bmi',
-            'category',
             'notes'
         ];
 
@@ -370,6 +440,15 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
             }
         }
 
+        if (array_key_exists('height', $data) || array_key_exists('weight', $data)) {
+            $height = array_key_exists('height', $data) ? (float) $data['height'] : (float) $existingPerson['height'];
+            $weight = array_key_exists('weight', $data) ? (float) $data['weight'] : (float) $existingPerson['weight'];
+            $bmi = calculateBmi($height, $weight);
+            $category = getBmiCategory($bmi);
+            $sets[] = "bmi = $bmi";
+            $sets[] = "category = '$category'";
+        }
+
         if (!$sets) {
             return jsonResponse($response, [
                 'error' => 'No fields to update',
@@ -383,7 +462,7 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
         $person = $pdo->query("SELECT * FROM persons WHERE id = $id")->fetch();
 
         return jsonResponse($response, [
-            'message' => 'BMI record updated. This route allows unsafe field updates.',
+            'message' => 'BMI record updated. Backend recalculated BMI and category when height or weight changed.',
             'person' => $person,
             'debug_received_body' => $data,
             'debug_sql' => $sql

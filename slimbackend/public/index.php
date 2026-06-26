@@ -168,11 +168,10 @@ function requireAuth(Request $request, Response $response): array|Response
 
 function exposeException(Response $response, Throwable $e): Response
 {
-    // INSECURE: exposes detailed internal error to API client.
+    error_log($e->getMessage());
+
     return jsonResponse($response, [
-        'error' => $e->getMessage(),
-        'file' => $e->getFile(),
-        'line' => $e->getLine()
+        'error' => 'Unable to process request'
     ], 500);
 }
 
@@ -238,6 +237,31 @@ function safeUser(array $user): array
         'role' => $user['role'],
         'created_at' => $user['created_at'] ?? null
     ];
+}
+
+function safePerson(array $person): array
+{
+    return [
+        'id' => $person['id'],
+        'user_id' => $person['user_id'],
+        'name' => $person['name'],
+        'age' => $person['age'],
+        'height' => $person['height'],
+        'weight' => $person['weight'],
+        'bmi' => $person['bmi'],
+        'category' => $person['category'],
+        'notes' => $person['notes'],
+        'created_at' => $person['created_at'] ?? null
+    ];
+}
+
+function safeStaffPerson(array $person): array
+{
+    $safePerson = safePerson($person);
+    $safePerson['owner_email'] = $person['owner_email'] ?? null;
+    $safePerson['owner_role'] = $person['owner_role'] ?? null;
+
+    return $safePerson;
 }
 
 function canViewPersonRecord(array $currentUser, array $person): bool
@@ -316,15 +340,13 @@ $app->post('/api/register', function (Request $request, Response $response) {
         $stmt->execute([$name, $email, $passwordHash, $role]);
         $id = $pdo->lastInsertId();
 
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
+        $stmt = $pdo->prepare("SELECT id, name, email, role, created_at FROM users WHERE id = ?");
         $stmt->execute([$id]);
         $user = $stmt->fetch();
 
         return jsonResponse($response, [
             'message' => 'User registered.',
-            'user' => safeUser($user),
-            'debug_received_body' => $data,
-            'debug_sql' => $sql
+            'user' => safeUser($user)
         ], 201);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -342,7 +364,7 @@ $app->post('/api/login', function (Request $request, Response $response) {
         $email = $data['email'] ?? '';
         $password = $data['password'] ?? '';
 
-        $sql = "SELECT * FROM users WHERE email = ? LIMIT 1";
+        $sql = "SELECT id, name, email, password_hash, role, created_at FROM users WHERE email = ? LIMIT 1";
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$email]);
         $user = $stmt->fetch();
@@ -354,15 +376,12 @@ $app->post('/api/login', function (Request $request, Response $response) {
             $passwordHash = password_hash($password, PASSWORD_DEFAULT);
             $updateStmt = $pdo->prepare("UPDATE users SET password = NULL, password_hash = ? WHERE id = ?");
             $updateStmt->execute([$passwordHash, $user['id']]);
-            $user['password'] = null;
             $user['password_hash'] = $passwordHash;
         }
 
         if (!$validPassword) {
             return jsonResponse($response, [
-                'error' => 'Invalid login',
-                'debug_received_body' => $data,
-                'debug_sql' => $sql
+                'error' => 'Invalid email or password'
             ], 401);
         }
 
@@ -371,9 +390,7 @@ $app->post('/api/login', function (Request $request, Response $response) {
         return jsonResponse($response, [
             'message' => 'Login successful.',
             'token' => $token,
-            'user' => safeUser($user),
-            'debug_received_body' => $data,
-            'debug_sql' => $sql
+            'user' => safeUser($user)
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -394,7 +411,7 @@ $app->get('/api/profile', function (Request $request, Response $response) {
 
         $userId = (int) $decoded['user_id'];
 
-        $sql = "SELECT * FROM users WHERE id = ?";
+        $sql = "SELECT id, name, email, role, created_at FROM users WHERE id = ?";
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$userId]);
         $user = $stmt->fetch();
@@ -428,8 +445,7 @@ $app->get('/api/persons', function (Request $request, Response $response) {
 
         return jsonResponse($response, [
             'message' => 'Own BMI records returned.',
-            'persons' => $persons,
-            'debug_sql' => $sql
+            'persons' => array_map('safePerson', $persons)
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -476,9 +492,7 @@ $app->post('/api/persons', function (Request $request, Response $response) {
 
         return jsonResponse($response, [
             'message' => 'BMI record created. Backend calculated BMI and category.',
-            'person' => $person,
-            'debug_received_body' => $data,
-            'debug_sql' => $sql
+            'person' => safePerson($person)
         ], 201);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -510,8 +524,7 @@ $app->get('/api/persons/{id}', function (Request $request, Response $response, a
 
         return jsonResponse($response, [
             'message' => 'BMI record returned.',
-            'person' => $person,
-            'debug_sql' => $sql
+            'person' => safePerson($person)
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -585,8 +598,7 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
 
         if (!$sets) {
             return jsonResponse($response, [
-                'error' => 'No fields to update',
-                'debug_received_body' => $data
+                'error' => 'No fields to update'
             ], 400);
         }
 
@@ -601,9 +613,7 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
 
         return jsonResponse($response, [
             'message' => 'BMI record updated. Backend recalculated BMI and category when height or weight changed.',
-            'person' => $person,
-            'debug_received_body' => $data,
-            'debug_sql' => $sql
+            'person' => safePerson($person)
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -637,8 +647,7 @@ $app->delete('/api/persons/{id}', function (Request $request, Response $response
         $stmt->execute([$id]);
 
         return jsonResponse($response, [
-            'message' => 'BMI record deleted.',
-            'debug_sql' => $sql
+            'message' => 'BMI record deleted.'
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -668,8 +677,7 @@ $app->get('/api/staff/persons', function (Request $request, Response $response) 
 
         return jsonResponse($response, [
             'message' => 'All BMI records returned for staff monitoring.',
-            'persons' => $persons,
-            'debug_sql' => $sql
+            'persons' => array_map('safeStaffPerson', $persons)
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -701,8 +709,7 @@ $app->get('/api/staff/persons/{id}', function (Request $request, Response $respo
 
         return jsonResponse($response, [
             'message' => 'Staff BMI record returned.',
-            'person' => $person,
-            'debug_sql' => $sql
+            'person' => safeStaffPerson($person)
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -721,16 +728,14 @@ $app->get('/api/admin/users', function (Request $request, Response $response) {
             return $roleError;
         }
 
-        // SELECT * still exposes password/password_hash. This is fixed in the next response-cleanup commit.
-        $sql = "SELECT * FROM users ORDER BY id ASC";
+        $sql = "SELECT id, name, email, role, created_at FROM users ORDER BY id ASC";
         $stmt = $pdo->prepare($sql);
         $stmt->execute();
         $users = $stmt->fetchAll();
 
         return jsonResponse($response, [
-            'message' => 'All users returned for admin. Sensitive fields still need a later fix.',
-            'users' => $users,
-            'debug_sql' => $sql
+            'message' => 'All users returned for admin.',
+            'users' => $users
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -753,15 +758,13 @@ $app->put('/api/admin/users/{id}/role', function (Request $request, Response $re
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$role, $id]);
 
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
+        $stmt = $pdo->prepare("SELECT id, name, email, role, created_at FROM users WHERE id = ?");
         $stmt->execute([$id]);
         $user = $stmt->fetch();
 
         return jsonResponse($response, [
             'message' => 'User role changed by admin.',
-            'user' => $user,
-            'debug_received_body' => $data,
-            'debug_sql' => $sql
+            'user' => $user
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -783,8 +786,7 @@ $app->delete('/api/admin/persons/{id}', function (Request $request, Response $re
         $stmt->execute([$id]);
 
         return jsonResponse($response, [
-            'message' => 'Admin delete executed.',
-            'debug_sql' => $sql
+            'message' => 'Admin delete executed.'
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);

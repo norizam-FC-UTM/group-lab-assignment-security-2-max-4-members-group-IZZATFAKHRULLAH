@@ -1,0 +1,11 @@
+# Vue
+vuefrontend/node_modules/
+vuefrontend/dist/
+
+# PHP Composer
+slimbackend/vendor/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

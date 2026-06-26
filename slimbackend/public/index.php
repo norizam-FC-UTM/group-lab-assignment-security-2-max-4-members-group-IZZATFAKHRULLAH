@@ -76,36 +76,94 @@ function getRequestData(Request $request): array
     return is_array($data) ? $data : [];
 }
 
-// INSECURE: This is NOT a real JWT.
-// This is just base64 JSON. You should replace this with real signed JWT sebagai pembaikan.
-function createFakeToken(array $user): string
+function base64UrlEncode(string $data): string
 {
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function base64UrlDecode(string $data): string|false
+{
+    $padding = strlen($data) % 4;
+    if ($padding > 0) {
+        $data .= str_repeat('=', 4 - $padding);
+    }
+
+    return base64_decode(strtr($data, '-_', '+/'), true);
+}
+
+function getJwtSecret(): string
+{
+    return 'SECJ3483_PERSON_BMI_LAB_SECRET';
+}
+
+function createJwtToken(array $user): string
+{
+    $header = [
+        'alg' => 'HS256',
+        'typ' => 'JWT'
+    ];
+
+    $issuedAt = time();
     $payload = [
         'user_id' => $user['id'],
         'role' => $user['role'],
-        'email' => $user['email'],
-        'note' => 'INSECURE_FAKE_TOKEN_NO_SIGNATURE_NO_EXPIRY'
+        'iat' => $issuedAt,
+        'exp' => $issuedAt + 3600
     ];
 
-    return base64_encode(json_encode($payload));
+    $headerPart = base64UrlEncode(json_encode($header));
+    $payloadPart = base64UrlEncode(json_encode($payload));
+    $signature = hash_hmac('sha256', "$headerPart.$payloadPart", getJwtSecret(), true);
+
+    return "$headerPart.$payloadPart." . base64UrlEncode($signature);
 }
 
-// INSECURE: This trusts an unsigned, editable token.
-// You should replace this with proper JWT verification.
-function getFakeUserFromToken(Request $request): ?array
+function verifyTokenFromRequest(Request $request): ?array
 {
     $auth = $request->getHeaderLine('Authorization');
 
     if (!$auth || !preg_match('/Bearer\s+(\S+)/', $auth, $matches)) {
         return null;
     }
-    $json = base64_decode($matches[1], true);
 
-    if (!$json) {
+    $parts = explode('.', $matches[1]);
+    if (count($parts) !== 3) {
         return null;
     }
-    $payload = json_decode($json, true);
-    return is_array($payload) ? $payload : null;
+
+    [$headerPart, $payloadPart, $signaturePart] = $parts;
+    $expectedSignature = base64UrlEncode(hash_hmac('sha256', "$headerPart.$payloadPart", getJwtSecret(), true));
+
+    if (!hash_equals($expectedSignature, $signaturePart)) {
+        return null;
+    }
+
+    $payloadJson = base64UrlDecode($payloadPart);
+    if ($payloadJson === false) {
+        return null;
+    }
+
+    $payload = json_decode($payloadJson, true);
+    if (!is_array($payload) || empty($payload['user_id']) || empty($payload['role'])) {
+        return null;
+    }
+
+    if (($payload['exp'] ?? 0) < time()) {
+        return null;
+    }
+
+    return $payload;
+}
+
+function requireAuth(Request $request, Response $response): array|Response
+{
+    $decoded = verifyTokenFromRequest($request);
+
+    if (!$decoded) {
+        return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+    }
+
+    return $decoded;
 }
 
 function exposeException(Response $response, Throwable $e): Response
@@ -180,6 +238,44 @@ function safeUser(array $user): array
         'role' => $user['role'],
         'created_at' => $user['created_at'] ?? null
     ];
+}
+
+function canViewPersonRecord(array $currentUser, array $person): bool
+{
+    $currentUserId = (int) ($currentUser['user_id'] ?? 0);
+    $recordOwnerId = (int) ($person['user_id'] ?? 0);
+    $role = $currentUser['role'] ?? 'user';
+
+    return $currentUserId === $recordOwnerId || in_array($role, ['staff', 'admin'], true);
+}
+
+function canModifyPersonRecord(array $currentUser, array $person): bool
+{
+    $currentUserId = (int) ($currentUser['user_id'] ?? 0);
+    $recordOwnerId = (int) ($person['user_id'] ?? 0);
+    $role = $currentUser['role'] ?? 'user';
+
+    return $currentUserId === $recordOwnerId || $role === 'admin';
+}
+
+function requireRole(Request $request, Response $response, array $allowedRoles): ?Response
+{
+    $decoded = verifyTokenFromRequest($request);
+
+    if (!$decoded) {
+        return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+    }
+
+    $role = $decoded['role'] ?? 'user';
+    if (!in_array($role, $allowedRoles, true)) {
+        $error = count($allowedRoles) === 1 && $allowedRoles[0] === 'admin'
+            ? 'Admin access required'
+            : 'Staff access required';
+
+        return jsonResponse($response, ['error' => $error], 403);
+    }
+
+    return null;
 }
 
 // ----------------------------------------------------------
@@ -270,11 +366,10 @@ $app->post('/api/login', function (Request $request, Response $response) {
             ], 401);
         }
 
-        // INSECURE: fake unsigned token with no expiry.
-        $token = createFakeToken($user);
+        $token = createJwtToken($user);
 
         return jsonResponse($response, [
-            'message' => 'Login successful. This token is intentionally insecure.',
+            'message' => 'Login successful.',
             'token' => $token,
             'user' => safeUser($user),
             'debug_received_body' => $data,
@@ -292,11 +387,12 @@ $app->get('/api/profile', function (Request $request, Response $response) {
     try {
         $pdo = getPDO();
 
-        // INSECURE:
-        // If token missing, defaults to user 1.
-        // If token exists, trusts unsigned editable token.
-        $fakeUser = getFakeUserFromToken($request);
-        $userId = $fakeUser['user_id'] ?? 1;
+        $decoded = requireAuth($request, $response);
+        if ($decoded instanceof Response) {
+            return $decoded;
+        }
+
+        $userId = (int) $decoded['user_id'];
 
         $sql = "SELECT * FROM users WHERE id = ?";
         $stmt = $pdo->prepare($sql);
@@ -304,9 +400,8 @@ $app->get('/api/profile', function (Request $request, Response $response) {
         $user = $stmt->fetch();
 
         return jsonResponse($response, [
-            'message' => 'Profile returned. This route trusts insecure token/default user.',
-            'user' => $user ? safeUser($user) : null,
-            'token_payload_trusted_by_backend' => $fakeUser
+            'message' => 'Profile returned.',
+            'user' => $user ? safeUser($user) : null
         ]);
     } catch (Throwable $e) {
         return exposeException($response, $e);
@@ -320,27 +415,19 @@ $app->get('/api/persons', function (Request $request, Response $response) {
     try {
         $pdo = getPDO();
 
-        // INSECURE:
-        // Trusts unsigned token. If no token, returns all records.
-        // Also accepts ?user_id= to override owner.
-        $fakeUser = getFakeUserFromToken($request);
-        $params = $request->getQueryParams();
-        $userId = $params['user_id'] ?? ($fakeUser['user_id'] ?? null);
-
-        if ($userId) {
-            $sql = "SELECT * FROM persons WHERE user_id = ? ORDER BY id DESC";
-            $stmt = $pdo->prepare($sql);
-            $stmt->execute([$userId]);
-        } else {
-            $sql = "SELECT * FROM persons ORDER BY id DESC";
-            $stmt = $pdo->prepare($sql);
-            $stmt->execute();
+        $decoded = requireAuth($request, $response);
+        if ($decoded instanceof Response) {
+            return $decoded;
         }
 
+        $userId = (int) $decoded['user_id'];
+        $sql = "SELECT * FROM persons WHERE user_id = ? ORDER BY id DESC";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$userId]);
         $persons = $stmt->fetchAll();
 
         return jsonResponse($response, [
-            'message' => 'BMI records returned. This route is intentionally weak.',
+            'message' => 'Own BMI records returned.',
             'persons' => $persons,
             'debug_sql' => $sql
         ]);
@@ -353,6 +440,11 @@ $app->post('/api/persons', function (Request $request, Response $response) {
     try {
         $pdo = getPDO();
         $data = getRequestData($request);
+        $decoded = requireAuth($request, $response);
+
+        if ($decoded instanceof Response) {
+            return $decoded;
+        }
 
         $validationErrors = validateBmiData($data);
         if ($validationErrors) {
@@ -362,9 +454,7 @@ $app->post('/api/persons', function (Request $request, Response $response) {
             ], 400);
         }
 
-        // INSECURE:
-        // - Trusts user_id from frontend.
-        $user_id = $data['user_id'] ?? 1;
+        $user_id = (int) $decoded['user_id'];
         $name = $data['name'] ?? '';
         $age = $data['age'] ?? 0;
         $height = $data['height'] ?? 0;
@@ -399,8 +489,12 @@ $app->get('/api/persons/{id}', function (Request $request, Response $response, a
     try {
         $pdo = getPDO();
         $id = $args['id'];
+        $decoded = requireAuth($request, $response);
 
-        // TODO: Review whether this route should allow all users to access any record.
+        if ($decoded instanceof Response) {
+            return $decoded;
+        }
+
         $sql = "SELECT * FROM persons WHERE id = ?";
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$id]);
@@ -410,8 +504,12 @@ $app->get('/api/persons/{id}', function (Request $request, Response $response, a
             return jsonResponse($response, ['error' => 'Record not found'], 404);
         }
 
+        if (!canViewPersonRecord($decoded, $person)) {
+            return jsonResponse($response, ['error' => 'Access denied'], 403);
+        }
+
         return jsonResponse($response, [
-            'message' => 'Record returned without ownership check.',
+            'message' => 'BMI record returned.',
             'person' => $person,
             'debug_sql' => $sql
         ]);
@@ -425,6 +523,11 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
         $pdo = getPDO();
         $id = $args['id'];
         $data = getRequestData($request);
+        $decoded = requireAuth($request, $response);
+
+        if ($decoded instanceof Response) {
+            return $decoded;
+        }
 
         $validationErrors = validateBmiData($data, false);
         if ($validationErrors) {
@@ -440,6 +543,10 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
 
         if (!$existingPerson) {
             return jsonResponse($response, ['error' => 'Record not found'], 404);
+        }
+
+        if (!canModifyPersonRecord($decoded, $existingPerson)) {
+            return jsonResponse($response, ['error' => 'Access denied'], 403);
         }
 
         // INSECURE MASS ASSIGNMENT:
@@ -507,14 +614,30 @@ $app->delete('/api/persons/{id}', function (Request $request, Response $response
     try {
         $pdo = getPDO();
         $id = $args['id'];
+        $decoded = requireAuth($request, $response);
 
-        // INSECURE: No auth, no ownership check, no role check.
+        if ($decoded instanceof Response) {
+            return $decoded;
+        }
+
+        $stmt = $pdo->prepare("SELECT * FROM persons WHERE id = ?");
+        $stmt->execute([$id]);
+        $person = $stmt->fetch();
+
+        if (!$person) {
+            return jsonResponse($response, ['error' => 'Record not found'], 404);
+        }
+
+        if (!canModifyPersonRecord($decoded, $person)) {
+            return jsonResponse($response, ['error' => 'Access denied'], 403);
+        }
+
         $sql = "DELETE FROM persons WHERE id = ?";
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$id]);
 
         return jsonResponse($response, [
-            'message' => 'BMI record deleted without role or ownership check.',
+            'message' => 'BMI record deleted.',
             'debug_sql' => $sql
         ]);
     } catch (Throwable $e) {
@@ -529,7 +652,11 @@ $app->get('/api/staff/persons', function (Request $request, Response $response) 
     try {
         $pdo = getPDO();
 
-        // INSECURE: No staff/admin role check.
+        $roleError = requireRole($request, $response, ['staff', 'admin']);
+        if ($roleError) {
+            return $roleError;
+        }
+
         $sql = "SELECT persons.*, users.email AS owner_email, users.role AS owner_role
                 FROM persons
                 JOIN users ON persons.user_id = users.id
@@ -540,7 +667,7 @@ $app->get('/api/staff/persons', function (Request $request, Response $response) 
         $persons = $stmt->fetchAll();
 
         return jsonResponse($response, [
-            'message' => 'All BMI records returned without staff role check.',
+            'message' => 'All BMI records returned for staff monitoring.',
             'persons' => $persons,
             'debug_sql' => $sql
         ]);
@@ -554,7 +681,11 @@ $app->get('/api/staff/persons/{id}', function (Request $request, Response $respo
         $pdo = getPDO();
         $id = $args['id'];
 
-        // INSECURE - Review whether this route should allow all users
+        $roleError = requireRole($request, $response, ['staff', 'admin']);
+        if ($roleError) {
+            return $roleError;
+        }
+
         $sql = "SELECT persons.*, users.email AS owner_email, users.role AS owner_role
                 FROM persons
                 JOIN users ON persons.user_id = users.id
@@ -569,7 +700,7 @@ $app->get('/api/staff/persons/{id}', function (Request $request, Response $respo
         }
 
         return jsonResponse($response, [
-            'message' => 'Staff record returned without role check.',
+            'message' => 'Staff BMI record returned.',
             'person' => $person,
             'debug_sql' => $sql
         ]);
@@ -585,16 +716,19 @@ $app->get('/api/admin/users', function (Request $request, Response $response) {
     try {
         $pdo = getPDO();
 
-        // INSECURE:
-        // - No admin role check.
-        // - SELECT * exposes password/password_hash.
+        $roleError = requireRole($request, $response, ['admin']);
+        if ($roleError) {
+            return $roleError;
+        }
+
+        // SELECT * still exposes password/password_hash. This is fixed in the next response-cleanup commit.
         $sql = "SELECT * FROM users ORDER BY id ASC";
         $stmt = $pdo->prepare($sql);
         $stmt->execute();
         $users = $stmt->fetchAll();
 
         return jsonResponse($response, [
-            'message' => 'All users returned without admin role check. Sensitive fields exposed.',
+            'message' => 'All users returned for admin. Sensitive fields still need a later fix.',
             'users' => $users,
             'debug_sql' => $sql
         ]);
@@ -610,7 +744,11 @@ $app->put('/api/admin/users/{id}/role', function (Request $request, Response $re
         $data = getRequestData($request);
         $role = $data['role'] ?? 'user';
 
-        // INSECURE: No admin role check. Anyone can change any user role.
+        $roleError = requireRole($request, $response, ['admin']);
+        if ($roleError) {
+            return $roleError;
+        }
+
         $sql = "UPDATE users SET role = ? WHERE id = ?";
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$role, $id]);
@@ -620,7 +758,7 @@ $app->put('/api/admin/users/{id}/role', function (Request $request, Response $re
         $user = $stmt->fetch();
 
         return jsonResponse($response, [
-            'message' => 'User role changed without admin verification.',
+            'message' => 'User role changed by admin.',
             'user' => $user,
             'debug_received_body' => $data,
             'debug_sql' => $sql
@@ -635,13 +773,17 @@ $app->delete('/api/admin/persons/{id}', function (Request $request, Response $re
         $pdo = getPDO();
         $id = $args['id'];
 
-        // INSECURE: No admin role check.
+        $roleError = requireRole($request, $response, ['admin']);
+        if ($roleError) {
+            return $roleError;
+        }
+
         $sql = "DELETE FROM persons WHERE id = ?";
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$id]);
 
         return jsonResponse($response, [
-            'message' => 'Admin delete executed without admin role verification.',
+            'message' => 'Admin delete executed.',
             'debug_sql' => $sql
         ]);
     } catch (Throwable $e) {
